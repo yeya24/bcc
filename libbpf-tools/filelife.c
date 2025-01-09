@@ -3,6 +3,9 @@
 //
 // Based on filelife(8) from BCC by Brendan Gregg & Allan McAleavy.
 // 20-Mar-2020   Wenbo Zhang   Created this.
+// 13-Nov-2022   Rong Tao      Check btf struct field for CO-RE and add vfs_open()
+// 23-Aug-2023   Rong Tao      Add vfs_* 'struct mnt_idmap' support.(CO-RE)
+// 08-Nov-2023   Rong Tao      Support unlink failed
 #include <argp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -14,6 +17,7 @@
 #include <bpf/bpf.h>
 #include "filelife.h"
 #include "filelife.skel.h"
+#include "btf_helpers.h"
 #include "trace_helpers.h"
 
 #define PERF_BUFFER_PAGES	16
@@ -39,9 +43,9 @@ const char argp_program_doc[] =
 "    filelife -p 123  # trace pid 123\n";
 
 static const struct argp_option opts[] = {
-	{ "pid", 'p', "PID", 0, "Process PID to trace" },
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "pid", 'p', "PID", 0, "Process PID to trace", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -71,8 +75,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	return 0;
 }
 
-int libbpf_print_fn(enum libbpf_print_level level,
-		    const char *format, va_list args)
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
 	if (level == LIBBPF_DEBUG && !env.verbose)
 		return 0;
@@ -86,17 +89,24 @@ static void sig_int(int signo)
 
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz)
 {
-	const struct event *e = data;
+	struct event e;
 	struct tm *tm;
 	char ts[32];
 	time_t t;
+
+	if (data_sz < sizeof(e)) {
+		printf("Error: packet too small\n");
+		return;
+	}
+	/* Copy data as alignment in the perf buffer isn't guaranteed. */
+	memcpy(&e, data, sizeof(e));
 
 	time(&t);
 	tm = localtime(&t);
 	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
 	printf("%-8s %-6d %-16s %-7.2f %s\n",
-	       ts, e->tgid, e->task, (double)e->delta_ns / 1000000000,
-	       e->file);
+	       ts, e.tgid, e.task, (double)e.delta_ns / 1000000000,
+	       e.file);
 }
 
 void handle_lost_events(void *ctx, int cpu, __u64 lost_cnt)
@@ -106,12 +116,12 @@ void handle_lost_events(void *ctx, int cpu, __u64 lost_cnt)
 
 int main(int argc, char **argv)
 {
+	LIBBPF_OPTS(bpf_object_open_opts, open_opts);
 	static const struct argp argp = {
 		.options = opts,
 		.parser = parse_arg,
 		.doc = argp_program_doc,
 	};
-	struct perf_buffer_opts pb_opts;
 	struct perf_buffer *pb = NULL;
 	struct filelife_bpf *obj;
 	int err;
@@ -122,13 +132,13 @@ int main(int argc, char **argv)
 
 	libbpf_set_print(libbpf_print_fn);
 
-	err = bump_memlock_rlimit();
+	err = ensure_core_btf(&open_opts);
 	if (err) {
-		fprintf(stderr, "failed to increase rlimit: %d\n", err);
+		fprintf(stderr, "failed to fetch necessary BTF for CO-RE: %s\n", strerror(-err));
 		return 1;
 	}
 
-	obj = filelife_bpf__open();
+	obj = filelife_bpf__open_opts(&open_opts);
 	if (!obj) {
 		fprintf(stderr, "failed to open BPF object\n");
 		return 1;
@@ -136,6 +146,9 @@ int main(int argc, char **argv)
 
 	/* initialize global data (filtering options) */
 	obj->rodata->targ_tgid = env.pid;
+
+	if (!kprobe_exists("security_inode_create"))
+		bpf_program__set_autoload(obj->progs.security_inode_create, false);
 
 	err = filelife_bpf__load(obj);
 	if (err) {
@@ -152,13 +165,10 @@ int main(int argc, char **argv)
 	printf("Tracing the lifespan of short-lived files ... Hit Ctrl-C to end.\n");
 	printf("%-8s %-6s %-16s %-7s %s\n", "TIME", "PID", "COMM", "AGE(s)", "FILE");
 
-	pb_opts.sample_cb = handle_event;
-	pb_opts.lost_cb = handle_lost_events;
 	pb = perf_buffer__new(bpf_map__fd(obj->maps.events), PERF_BUFFER_PAGES,
-			      &pb_opts);
-	err = libbpf_get_error(pb);
-	if (err) {
-		pb = NULL;
+			      handle_event, handle_lost_events, NULL, NULL);
+	if (!pb) {
+		err = -errno;
 		fprintf(stderr, "failed to open perf buffer: %d\n", err);
 		goto cleanup;
 	}
@@ -171,8 +181,8 @@ int main(int argc, char **argv)
 
 	while (!exiting) {
 		err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT_MS);
-		if (err < 0 && errno != EINTR) {
-			fprintf(stderr, "error polling perf buffer: %s\n", strerror(errno));
+		if (err < 0 && err != -EINTR) {
+			fprintf(stderr, "error polling perf buffer: %s\n", strerror(-err));
 			goto cleanup;
 		}
 		/* reset err to return 0 if exiting */
@@ -182,6 +192,7 @@ int main(int argc, char **argv)
 cleanup:
 	perf_buffer__free(pb);
 	filelife_bpf__destroy(obj);
+	cleanup_core_btf(&open_opts);
 
 	return err != 0;
 }
