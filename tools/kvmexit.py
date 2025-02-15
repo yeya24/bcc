@@ -81,7 +81,7 @@ duration = int(args.duration)
 bpf_text = """
 #include <linux/delay.h>
 
-#define REASON_NUM 69
+#define REASON_NUM 76
 #define TGID_NUM 1024
 
 struct exit_count {
@@ -96,10 +96,10 @@ struct cache_info {
 };
 BPF_PERCPU_ARRAY(pcpu_cache, struct cache_info, 1);
 
-FUNC_ENTRY {
+TRACEPOINT_PROBE(kvm, kvm_exit) {
     int cache_miss = 0;
     int zero = 0;
-    u32 er = GET_ER;
+    u32 er = args->exit_reason;
     if (er >= REASON_NUM) {
         return 0;
     }
@@ -234,6 +234,13 @@ exit_reasons = (
     "N/A",
     "UMWAIT",
     "TPAUSE"
+    "N/A",
+    "N/A",
+    "N/A",
+    "N/A",
+    "N/A",
+    "BUS_LOCK",
+    "NOTIFY",
 )
 
 #
@@ -255,19 +262,6 @@ try:
         raise Exception("Please insmod kvm module to use kvmexit tool.")
 except Exception as e:
     raise Exception("Failed to do precondition check, due to: %s." % e)
-
-try:
-    if BPF.support_raw_tracepoint_in_module():
-        # Let's firstly try raw_tracepoint_in_module
-        func_entry = "RAW_TRACEPOINT_PROBE(kvm_exit)"
-        get_er = "ctx->args[0]"
-    else:
-        # If raw_tp_in_module is not supported, fall back to regular tp
-        func_entry = "TRACEPOINT_PROBE(kvm, kvm_exit)"
-        get_er = "args->exit_reason"
-except Exception as e:
-    raise Exception("Failed to catch kvm exit reasons due to: %s" % e)
-
 
 def find_tid(tgt_dir, tgt_vcpu):
     for tid in os.listdir(tgt_dir):
@@ -309,10 +303,6 @@ else:
     thread_filter = '0'
     header_format = "PID      TID      "
 bpf_text = bpf_text.replace('THREAD_FILTER', thread_filter)
-
-# For kernel >= 5.0, use RAW_TRACEPOINT_MODULE for performance consideration
-bpf_text = bpf_text.replace('FUNC_ENTRY', func_entry)
-bpf_text = bpf_text.replace('GET_ER', get_er)
 b = BPF(text=bpf_text)
 
 

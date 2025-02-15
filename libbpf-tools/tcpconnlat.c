@@ -45,11 +45,11 @@ const char argp_program_doc[] =
 "    tcpconnlat -L           # include LPORT while printing outputs\n";
 
 static const struct argp_option opts[] = {
-	{ "timestamp", 't', NULL, 0, "Include timestamp on output" },
-	{ "pid", 'p', "PID", 0, "Trace this PID only" },
-	{ "lport", 'L', NULL, 0, "Include LPORT on output" },
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "timestamp", 't', NULL, 0, "Include timestamp on output", 0 },
+	{ "pid", 'p', "PID", 0, "Trace this PID only", 0 },
+	{ "lport", 'L', NULL, 0, "Include LPORT on output", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -97,8 +97,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	return 0;
 }
 
-int libbpf_print_fn(enum libbpf_print_level level,
-		    const char *format, va_list args)
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
 	if (level == LIBBPF_DEBUG && !env.verbose)
 		return 0;
@@ -162,7 +161,6 @@ int main(int argc, char **argv)
 		.parser = parse_arg,
 		.doc = argp_program_doc,
 	};
-	struct perf_buffer_opts pb_opts;
 	struct perf_buffer *pb = NULL;
 	struct tcpconnlat_bpf *obj;
 	int err;
@@ -173,12 +171,6 @@ int main(int argc, char **argv)
 
 	libbpf_set_print(libbpf_print_fn);
 
-	err = bump_memlock_rlimit();
-	if (err) {
-		fprintf(stderr, "failed to increase rlimit: %d\n", err);
-		return 1;
-	}
-
 	obj = tcpconnlat_bpf__open();
 	if (!obj) {
 		fprintf(stderr, "failed to open BPF object\n");
@@ -188,6 +180,19 @@ int main(int argc, char **argv)
 	/* initialize global data (filtering options) */
 	obj->rodata->targ_min_us = env.min_us;
 	obj->rodata->targ_tgid = env.pid;
+
+	if (fentry_can_attach("tcp_v4_connect", NULL)) {
+		bpf_program__set_attach_target(obj->progs.fentry_tcp_v4_connect, 0, "tcp_v4_connect");
+		bpf_program__set_attach_target(obj->progs.fentry_tcp_v6_connect, 0, "tcp_v6_connect");
+		bpf_program__set_attach_target(obj->progs.fentry_tcp_rcv_state_process, 0, "tcp_rcv_state_process");
+		bpf_program__set_autoload(obj->progs.tcp_v4_connect, false);
+		bpf_program__set_autoload(obj->progs.tcp_v6_connect, false);
+		bpf_program__set_autoload(obj->progs.tcp_rcv_state_process, false);
+	} else {
+		bpf_program__set_autoload(obj->progs.fentry_tcp_v4_connect, false);
+		bpf_program__set_autoload(obj->progs.fentry_tcp_v6_connect, false);
+		bpf_program__set_autoload(obj->progs.fentry_tcp_rcv_state_process, false);
+	}
 
 	err = tcpconnlat_bpf__load(obj);
 	if (err) {
@@ -200,15 +205,10 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	pb_opts.sample_cb = handle_event;
-
-	pb_opts.lost_cb = handle_lost_events;
 	pb = perf_buffer__new(bpf_map__fd(obj->maps.events), PERF_BUFFER_PAGES,
-			      &pb_opts);
-	err = libbpf_get_error(pb);
-	if (err) {
-		pb = NULL;
-		fprintf(stderr, "failed to open perf buffer: %d\n", err);
+			      handle_event, handle_lost_events, NULL, NULL);
+	if (!pb) {
+		fprintf(stderr, "failed to open perf buffer: %d\n", errno);
 		goto cleanup;
 	}
 
@@ -223,7 +223,6 @@ int main(int argc, char **argv)
 			"PID", "COMM", "IP", "SADDR", "DADDR", "DPORT", "LAT(ms)");
 	}
 
-
 	if (signal(SIGINT, sig_int) == SIG_ERR) {
 		fprintf(stderr, "can't set signal handler: %s\n", strerror(errno));
 		err = 1;
@@ -233,8 +232,8 @@ int main(int argc, char **argv)
 	/* main: poll */
 	while (!exiting) {
 		err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT_MS);
-		if (err < 0 && errno != EINTR) {
-			fprintf(stderr, "error polling perf buffer: %s\n", strerror(errno));
+		if (err < 0 && err != -EINTR) {
+			fprintf(stderr, "error polling perf buffer: %s\n", strerror(-err));
 			goto cleanup;
 		}
 		/* reset err to return 0 if exiting */

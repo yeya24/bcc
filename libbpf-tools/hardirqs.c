@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "hardirqs.h"
@@ -24,9 +25,13 @@ struct env {
 	int times;
 	bool timestamp;
 	bool verbose;
+	char *cgroupspath;
+	bool cg;
+	int targ_cpu;
 } env = {
 	.interval = 99999999,
 	.times = 99999999,
+	.targ_cpu = -1,
 };
 
 static volatile bool exiting;
@@ -37,21 +42,25 @@ const char *argp_program_bug_address =
 const char argp_program_doc[] =
 "Summarize hard irq event time as histograms.\n"
 "\n"
-"USAGE: hardirqs [--help] [-T] [-N] [-d] [interval] [count]\n"
+"USAGE: hardirqs [--help] [-T] [-N] [-d] [interval] [count] [-c CG]\n"
 "\n"
 "EXAMPLES:\n"
 "    hardirqs            # sum hard irq event time\n"
 "    hardirqs -d         # show hard irq event time as histograms\n"
 "    hardirqs 1 10       # print 1 second summaries, 10 times\n"
+"    hardirqs -c CG      # Trace process under cgroupsPath CG\n"
+"    hardirqs --cpu 1    # only stat irq on cpu 1\n"
 "    hardirqs -NT 1      # 1s summaries, nanoseconds, and timestamps\n";
 
 static const struct argp_option opts[] = {
-	{ "count", 'C', NULL, 0, "Show event counts instead of timing" },
-	{ "distributed", 'd', NULL, 0, "Show distributions as histograms" },
-	{ "timestamp", 'T', NULL, 0, "Include timestamp on output" },
-	{ "nanoseconds", 'N', NULL, 0, "Output in nanoseconds" },
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "count", 'C', NULL, 0, "Show event counts instead of timing", 0 },
+	{ "distributed", 'd', NULL, 0, "Show distributions as histograms", 0 },
+	{ "cgroup", 'c', "/sys/fs/cgroup/unified", 0, "Trace process in cgroup path", 0 },
+	{ "cpu", 's', "CPU", 0, "Only stat irq on selected cpu", 0 },
+	{ "timestamp", 'T', NULL, 0, "Include timestamp on output", 0 },
+	{ "nanoseconds", 'N', NULL, 0, "Output in nanoseconds", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -71,6 +80,18 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case 'C':
 		env.count = true;
+		break;
+	case 's':
+		errno = 0;
+		env.targ_cpu = atoi(arg);
+		if (errno || env.targ_cpu < 0) {
+			fprintf(stderr, "invalid cpu: %s\n", arg);
+			argp_usage(state);
+		}
+		break;
+	case 'c':
+		env.cgroupspath = arg;
+		env.cg = true;
 		break;
 	case 'N':
 		env.nanoseconds = true;
@@ -105,8 +126,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	return 0;
 }
 
-int libbpf_print_fn(enum libbpf_print_level level,
-		const char *format, va_list args)
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
 	if (level == LIBBPF_DEBUG && !env.verbose)
 		return 0;
@@ -176,6 +196,8 @@ int main(int argc, char **argv)
 	char ts[32];
 	time_t t;
 	int err;
+	int idx, cg_map_fd;
+	int cgfd = -1;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err)
@@ -188,17 +210,27 @@ int main(int argc, char **argv)
 
 	libbpf_set_print(libbpf_print_fn);
 
-	err = bump_memlock_rlimit();
-	if (err) {
-		fprintf(stderr, "failed to increase rlimit: %d\n", err);
-		return 1;
-	}
-
 	obj = hardirqs_bpf__open();
 	if (!obj) {
 		fprintf(stderr, "failed to open BPF object\n");
 		return 1;
 	}
+
+	if (probe_tp_btf("irq_handler_entry")) {
+		bpf_program__set_autoload(obj->progs.irq_handler_entry, false);
+		bpf_program__set_autoload(obj->progs.irq_handler_exit, false);
+		if (env.count)
+			bpf_program__set_autoload(obj->progs.irq_handler_exit_btf, false);
+	} else {
+		bpf_program__set_autoload(obj->progs.irq_handler_entry_btf, false);
+		bpf_program__set_autoload(obj->progs.irq_handler_exit_btf, false);
+		if (env.count)
+			bpf_program__set_autoload(obj->progs.irq_handler_exit, false);
+	}
+
+	obj->rodata->filter_cg = env.cg;
+	obj->rodata->do_count = env.count;
+	obj->rodata->targ_cpu = env.targ_cpu;
 
 	/* initialize global data (filtering options) */
 	if (!env.count) {
@@ -212,32 +244,25 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	if (env.count) {
-		obj->links.handle__irq_handler =
-			bpf_program__attach(obj->progs.handle__irq_handler);
-		err = libbpf_get_error(obj->links.handle__irq_handler);
-		if (err) {
-			fprintf(stderr,
-				"failed to attach irq/irq_handler_entry: %s\n",
-				strerror(err));
+	/* update cgroup path fd to map */
+	if (env.cg) {
+		idx = 0;
+		cg_map_fd = bpf_map__fd(obj->maps.cgroup_map);
+		cgfd = open(env.cgroupspath, O_RDONLY);
+		if (cgfd < 0) {
+			fprintf(stderr, "Failed opening Cgroup path: %s", env.cgroupspath);
+			goto cleanup;
 		}
-	} else {
-		obj->links.irq_handler_entry =
-			bpf_program__attach(obj->progs.irq_handler_entry);
-		err = libbpf_get_error(obj->links.irq_handler_entry);
-		if (err) {
-			fprintf(stderr,
-				"failed to attach irq_handler_entry: %s\n",
-				strerror(err));
+		if (bpf_map_update_elem(cg_map_fd, &idx, &cgfd, BPF_ANY)) {
+			fprintf(stderr, "Failed adding target cgroup to map");
+			goto cleanup;
 		}
-		obj->links.irq_handler_exit_exit =
-			bpf_program__attach(obj->progs.irq_handler_exit_exit);
-		err = libbpf_get_error(obj->links.irq_handler_exit_exit);
-		if (err) {
-			fprintf(stderr,
-				"failed to attach irq_handler_exit: %s\n",
-				strerror(err));
-		}
+	}
+
+	err = hardirqs_bpf__attach(obj);
+	if (err) {
+		fprintf(stderr, "failed to attach BPF object: %d\n", err);
+		goto cleanup;
 	}
 
 	signal(SIGINT, sig_handler);
@@ -269,6 +294,8 @@ int main(int argc, char **argv)
 
 cleanup:
 	hardirqs_bpf__destroy(obj);
+	if (cgfd > 0)
+		close(cgfd);
 
 	return err != 0;
 }

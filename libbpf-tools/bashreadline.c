@@ -12,6 +12,7 @@
 #include <bpf/bpf.h>
 #include "bashreadline.h"
 #include "bashreadline.skel.h"
+#include "btf_helpers.h"
 #include "trace_helpers.h"
 #include "uprobe_helpers.h"
 
@@ -34,12 +35,14 @@ const char argp_program_doc[] =
 "    bashreadline -s /usr/lib/libreadline.so\n";
 
 static const struct argp_option opts[] = {
-	{ "shared", 's', "PATH", 0, "the location of libreadline.so library" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "shared", 's', "PATH", 0, "the location of libreadline.so library", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
 static char *libreadline_path = NULL;
+static bool verbose = false;
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
@@ -49,6 +52,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		if (libreadline_path == NULL)
 			return ARGP_ERR_UNKNOWN;
 		break;
+	case 'v':
+		verbose = true;
+		break;
 	case 'h':
 		argp_state_help(state, stderr, ARGP_HELP_STD_HELP);
 		break;
@@ -56,6 +62,13 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		return ARGP_ERR_UNKNOWN;
 	}
 	return 0;
+}
+
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
+{
+	if (level == LIBBPF_DEBUG && !verbose)
+		return 0;
+	return vfprintf(stderr, format, args);
 }
 
 static void handle_event(void *ctx, int cpu, void *data, __u32 data_size)
@@ -77,6 +90,41 @@ static void handle_lost_events(void *ctx, int cpu, __u64 lost_cnt)
 	warn("lost %llu events on CPU #%d\n", lost_cnt, cpu);
 }
 
+static char *find_readline_function_name(const char *bash_path)
+{
+  bool found = false;
+  int fd = -1;
+  Elf *elf = NULL;
+  Elf_Scn *scn = NULL;
+  GElf_Shdr shdr;
+
+
+  elf = open_elf(bash_path, &fd);
+
+  while ((scn = elf_nextscn(elf, scn)) != NULL && !found) {
+    gelf_getshdr(scn, &shdr);
+    if (shdr.sh_type == SHT_SYMTAB || shdr.sh_type == SHT_DYNSYM) {
+      Elf_Data *data = elf_getdata(scn, NULL);
+      if (data != NULL) {
+        GElf_Sym *symtab = (GElf_Sym *) data->d_buf;
+        int sym_count = shdr.sh_size / shdr.sh_entsize;
+        for (int i = 0; i < sym_count; ++i) {
+          if(strcmp("readline_internal_teardown", elf_strptr(elf, shdr.sh_link, symtab[i].st_name)) == 0){
+            found = true;
+            break;
+          }
+        }
+    	}
+    }
+  }
+
+  close_elf(elf,fd);
+  if (found)
+    return "readline_internal_teardown";
+  else
+    return "readline";
+}
+
 static char *find_readline_so()
 {
 	const char *bash_path = "/bin/bash";
@@ -87,7 +135,7 @@ static char *find_readline_so()
 	char path[128];
 	char *result = NULL;
 
-	func_off = get_elf_func_offset(bash_path, "readline");
+	func_off = get_elf_func_offset(bash_path, find_readline_function_name(bash_path));
 	if (func_off >= 0)
 		return strdup(bash_path);
 
@@ -120,7 +168,7 @@ cleanup:
 	if (line)
 		free(line);
 	if (fp)
-		fclose(fp);
+		pclose(fp);
 	return result;
 }
 
@@ -131,13 +179,13 @@ static void sig_int(int signo)
 
 int main(int argc, char **argv)
 {
+	LIBBPF_OPTS(bpf_object_open_opts, open_opts);
 	static const struct argp argp = {
 		.options = opts,
 		.parser = parse_arg,
 		.doc = argp_program_doc,
 	};
 	struct bashreadline_bpf *obj = NULL;
-	struct perf_buffer_opts pb_opts;
 	struct perf_buffer *pb = NULL;
 	char *readline_so_path;
 	off_t func_off;
@@ -146,7 +194,6 @@ int main(int argc, char **argv)
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err)
 		return err;
-
 	if (libreadline_path) {
 		readline_so_path = libreadline_path;
 	} else if ((readline_so_path = find_readline_so()) == NULL) {
@@ -154,19 +201,27 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	err = bump_memlock_rlimit();
+	libbpf_set_print(libbpf_print_fn);
+
+	err = ensure_core_btf(&open_opts);
 	if (err) {
-		warn("failed to increase rlimit: %d\n", err);
+		warn("failed to fetch necessary BTF for CO-RE: %s\n", strerror(-err));
 		goto cleanup;
 	}
 
-	obj = bashreadline_bpf__open_and_load();
+	obj = bashreadline_bpf__open_opts(&open_opts);
 	if (!obj) {
-		warn("failed to open and load BPF object\n");
+		warn("failed to open BPF object\n");
 		goto cleanup;
 	}
 
-	func_off = get_elf_func_offset(readline_so_path, "readline");
+	err = bashreadline_bpf__load(obj);
+	if (err) {
+		warn("failed to load BPF object: %d\n", err);
+		goto cleanup;
+	}
+
+	func_off = get_elf_func_offset(readline_so_path, find_readline_function_name(readline_so_path));
 	if (func_off < 0) {
 		warn("cound not find readline in %s\n", readline_so_path);
 		goto cleanup;
@@ -174,17 +229,16 @@ int main(int argc, char **argv)
 
 	obj->links.printret = bpf_program__attach_uprobe(obj->progs.printret, true, -1,
 							 readline_so_path, func_off);
-	err = libbpf_get_error(obj->links.printret);
-	if (err) {
+	if (!obj->links.printret) {
+		err = -errno;
 		warn("failed to attach readline: %d\n", err);
 		goto cleanup;
 	}
 
-	pb_opts.sample_cb = handle_event;
-	pb_opts.lost_cb = handle_lost_events;
-	pb = perf_buffer__new(bpf_map__fd(obj->maps.events), PERF_BUFFER_PAGES, &pb_opts);
-	err = libbpf_get_error(pb);
-	if (err) {
+	pb = perf_buffer__new(bpf_map__fd(obj->maps.events), PERF_BUFFER_PAGES,
+			      handle_event, handle_lost_events, NULL, NULL);
+	if (!pb) {
+		err = -errno;
 		warn("failed to open perf buffer: %d\n", err);
 		goto cleanup;
 	}
@@ -198,8 +252,8 @@ int main(int argc, char **argv)
 	printf("%-9s %-7s %s\n", "TIME", "PID", "COMMAND");
 	while (!exiting) {
 		err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT_MS);
-		if (err < 0 && errno != EINTR) {
-			warn("error polling perf buffer: %s\n", strerror(errno));
+		if (err < 0 && err != -EINTR) {
+			warn("error polling perf buffer: %s\n", strerror(-err));
 			goto cleanup;
 		}
 		err = 0;
@@ -210,6 +264,7 @@ cleanup:
 		free(readline_so_path);
 	perf_buffer__free(pb);
 	bashreadline_bpf__destroy(obj);
+	cleanup_core_btf(&open_opts);
 
 	return err != 0;
 }
